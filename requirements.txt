@@ -1,0 +1,11 @@
+torch>=2.1.0
+diffusers>=0.33.0
+transformers>=4.36.0
+accelerate
+sentencepiece
+protobuf
+controlnet-aux>=0.0.9
+pillow
+opencv-python
+numpy
+gradio
