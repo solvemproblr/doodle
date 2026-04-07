@@ -12,7 +12,7 @@ Models:
 
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from diffusers import FluxControlNetPipeline, FluxControlNetModel
 from diffusers.utils import load_image
 
@@ -27,15 +27,23 @@ IMAGE_ENCODER = "openai/clip-vit-large-patch14"
 def preprocess_doodle(
     image: Image.Image,
     target_size: tuple[int, int] = (1024, 1024),
-    invert: bool = True,
 ) -> Image.Image:
     """Convert a child's doodle into a ControlNet-ready lineart image.
 
+    The ControlNet expects bright/white lines on a pure black background.
+    Children's doodles are typically dark lines on white paper, so we invert
+    and boost contrast to produce a strong control signal.
+
     Args:
-        image: Input doodle (any mode).
-        target_size: Output resolution (width, height). Will be snapped to multiples of 16.
-        invert: If True, auto-invert white-background doodles to white-on-black.
+        image: Input doodle (any mode — RGB, RGBA, L, etc.).
+        target_size: Output resolution (width, height). Snapped to multiples of 16.
     """
+    # Handle RGBA: composite onto white background first
+    if image.mode == "RGBA":
+        bg = Image.new("RGB", image.size, (255, 255, 255))
+        bg.paste(image, mask=image.split()[3])
+        image = bg
+
     img = image.convert("L")
 
     # Snap to multiples of 16
@@ -44,10 +52,25 @@ def preprocess_doodle(
     h -= h % 16
     img = img.resize((w, h), Image.LANCZOS)
 
-    arr = np.array(img)
+    arr = np.array(img, dtype=np.float32)
 
-    if invert and arr.mean() > 127:
-        arr = 255 - arr
+    # Determine if this is dark-on-light (typical doodle) or light-on-dark
+    is_light_background = arr.mean() > 127
+
+    if is_light_background:
+        # Invert: dark lines on white → white lines on black
+        arr = 255.0 - arr
+
+    # Boost contrast: stretch the line values to full 0-255 range
+    lo, hi = arr.min(), arr.max()
+    if hi - lo > 1e-3:
+        arr = (arr - lo) / (hi - lo) * 255.0
+    arr = arr.clip(0, 255).astype(np.uint8)
+
+    # Apply a threshold to clean up noise and make lines crisp
+    # Pixels above threshold become full white (lines), rest become black
+    threshold = 30  # low threshold to keep faint strokes
+    arr = np.where(arr > threshold, 255, 0).astype(np.uint8)
 
     return Image.fromarray(arr).convert("RGB")
 
@@ -56,7 +79,7 @@ def build_pipeline(
     device: str = "cuda",
     enable_cpu_offload: bool = True,
     enable_ip_adapter: bool = True,
-    ip_adapter_scale: float = 0.7,
+    ip_adapter_scale: float = 0.5,
 ) -> FluxControlNetPipeline:
     """Build the FLUX ControlNet pipeline with optional IP-Adapter.
 
@@ -98,32 +121,19 @@ def generate(
     doodle: Image.Image,
     prompt: str,
     reference_image: Image.Image | None = None,
-    negative_prompt: str = "blurry, low quality, distorted, deformed",
-    controlnet_conditioning_scale: float = 0.6,
-    control_guidance_end: float = 0.8,
+    controlnet_conditioning_scale: float = 0.9,
     ip_adapter_scale: float | None = None,
     num_inference_steps: int = 28,
     guidance_scale: float = 3.5,
     width: int = 1024,
     height: int = 1024,
     seed: int = -1,
-) -> Image.Image:
+) -> tuple[Image.Image, Image.Image]:
     """Generate a realistic image from a doodle.
 
-    Args:
-        pipe: The loaded pipeline.
-        doodle: Raw doodle image (will be preprocessed).
-        prompt: Text description of desired output.
-        reference_image: Optional style/content reference for IP-Adapter.
-        negative_prompt: What to avoid.
-        controlnet_conditioning_scale: ControlNet strength (0.0–1.0).
-        control_guidance_end: Stop applying ControlNet at this fraction of steps.
-        ip_adapter_scale: Override IP-Adapter scale for this generation.
-        num_inference_steps: Diffusion steps.
-        guidance_scale: CFG scale.
-        width: Output width (snapped to multiple of 16).
-        height: Output height (snapped to multiple of 16).
-        seed: Random seed (-1 for random).
+    Returns:
+        Tuple of (generated_image, preprocessed_control_image) so the user
+        can verify the control signal looks correct.
     """
     # Snap dimensions
     width -= width % 16
@@ -142,8 +152,6 @@ def generate(
         prompt=prompt,
         control_image=control_image,
         controlnet_conditioning_scale=controlnet_conditioning_scale,
-        control_guidance_start=0.0,
-        control_guidance_end=control_guidance_end,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         width=width,
@@ -156,4 +164,4 @@ def generate(
         kwargs["ip_adapter_image"] = ref
 
     result = pipe(**kwargs).images[0]
-    return result
+    return result, control_image

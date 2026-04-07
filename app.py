@@ -30,7 +30,6 @@ def run(
     reference_image: Image.Image | None,
     prompt: str,
     controlnet_scale: float,
-    control_guidance_end: float,
     ip_adapter_scale: float,
     steps: int,
     guidance_scale: float,
@@ -46,13 +45,12 @@ def run(
 
     p = load_pipeline(use_ip_adapter=reference_image is not None)
 
-    result = generate(
+    result, control_preview = generate(
         pipe=p,
         doodle=doodle,
         prompt=prompt,
         reference_image=reference_image,
         controlnet_conditioning_scale=controlnet_scale,
-        control_guidance_end=control_guidance_end,
         ip_adapter_scale=ip_adapter_scale if reference_image else None,
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
@@ -60,7 +58,7 @@ def run(
         height=height,
         seed=seed,
     )
-    return result
+    return result, control_preview
 
 
 def create_ui():
@@ -88,11 +86,9 @@ def create_ui():
                 )
 
                 with gr.Accordion("Advanced settings", open=False):
-                    controlnet_scale = gr.Slider(0.0, 1.5, value=0.6, step=0.05,
+                    controlnet_scale = gr.Slider(0.0, 2.0, value=0.9, step=0.05,
                                                   label="ControlNet strength")
-                    control_end = gr.Slider(0.0, 1.0, value=0.8, step=0.05,
-                                             label="ControlNet guidance end")
-                    ip_scale = gr.Slider(0.0, 1.5, value=0.7, step=0.05,
+                    ip_scale = gr.Slider(0.0, 1.5, value=0.5, step=0.05,
                                           label="IP-Adapter strength")
                     steps = gr.Slider(10, 50, value=28, step=1,
                                        label="Inference steps")
@@ -107,15 +103,19 @@ def create_ui():
 
             with gr.Column():
                 output_image = gr.Image(label="Result", type="pil")
+                control_preview = gr.Image(
+                    label="Control image (what ControlNet sees — should be white lines on black)",
+                    type="pil",
+                )
 
         generate_btn.click(
             fn=run,
             inputs=[
                 doodle_input, reference_input, prompt_input,
-                controlnet_scale, control_end, ip_scale,
+                controlnet_scale, ip_scale,
                 steps, guidance, width, height, seed,
             ],
-            outputs=output_image,
+            outputs=[output_image, control_preview],
         )
 
     return demo
