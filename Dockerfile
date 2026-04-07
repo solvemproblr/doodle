@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     libgl1 \
     libglib2.0-0 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
@@ -21,7 +22,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pipeline.py app.py ./
 
-# HuggingFace cache inside the container (mount a volume to persist)
 ENV HF_HOME=/data/huggingface
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860

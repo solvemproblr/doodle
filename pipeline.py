@@ -1,167 +1,124 @@
 """
-Doodle-to-Realistic Image Pipeline
+Doodle-to-Video Pipeline
 
-Uses FLUX.1-dev + ControlNet (lineart) + IP-Adapter to transform
-children's doodles into realistic images.
-
-Models:
-  - Base: black-forest-labs/FLUX.1-dev
-  - ControlNet: promeai/FLUX.1-controlnet-lineart-promeai
-  - IP-Adapter: XLabs-AI/flux-ip-adapter (CLIP ViT-L/14 encoder)
+1. Remove paper background from the doodle (rembg)
+2. Place on a neutral background
+3. Feed to Wan2.1 14B I2V with a fixed prompt to generate animated video
 """
 
+import io
 import torch
 import numpy as np
-from PIL import Image, ImageOps
-from diffusers import FluxControlNetPipeline, FluxControlNetModel
-from diffusers.utils import load_image
+from PIL import Image
+from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
+from diffusers.utils import export_to_video
+from rembg import remove
 
 
-BASE_MODEL = "black-forest-labs/FLUX.1-dev"
-CONTROLNET_MODEL = "promeai/FLUX.1-controlnet-lineart-promeai"
-IP_ADAPTER_REPO = "XLabs-AI/flux-ip-adapter"
-IP_ADAPTER_WEIGHTS = "ip_adapter.safetensors"
-IMAGE_ENCODER = "openai/clip-vit-large-patch14"
+WAN_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+
+FIXED_PROMPT = (
+    "a children's hand-drawn character comes to life in a beautiful natural setting, "
+    "the original drawing style is fully preserved, soft golden hour lighting, "
+    "gentle ambient motion in the background, leaves and particles floating softly, "
+    "studio ghibli atmosphere, cinematic, whimsical"
+)
 
 
-def preprocess_doodle(
-    image: Image.Image,
-    target_size: tuple[int, int] = (1024, 1024),
+def remove_background(image: Image.Image) -> Image.Image:
+    """Remove the paper/white background from a doodle, returning RGBA."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    result = remove(image)
+    return result
+
+
+def prepare_input_image(
+    doodle: Image.Image,
+    target_size: tuple[int, int] = (832, 480),
+    bg_color: tuple[int, int, int] = (135, 206, 235),
 ) -> Image.Image:
-    """Convert a child's doodle into a ControlNet-ready lineart image.
-
-    The ControlNet expects bright/white lines on a pure black background.
-    Children's doodles are typically dark lines on white paper, so we invert
-    and boost contrast to produce a strong control signal.
+    """Remove background from doodle and place on a colored background.
 
     Args:
-        image: Input doodle (any mode — RGB, RGBA, L, etc.).
-        target_size: Output resolution (width, height). Snapped to multiples of 16.
+        doodle: Raw doodle image.
+        target_size: (width, height) for Wan input. Must be multiples of 16.
+        bg_color: Background color RGB. Default is sky blue.
     """
-    # Handle RGBA: composite onto white background first
-    if image.mode == "RGBA":
-        bg = Image.new("RGB", image.size, (255, 255, 255))
-        bg.paste(image, mask=image.split()[3])
-        image = bg
+    # Remove paper background
+    character = remove_background(doodle)
 
-    img = image.convert("L")
-
-    # Snap to multiples of 16
+    # Create background canvas
     w, h = target_size
-    w -= w % 16
-    h -= h % 16
-    img = img.resize((w, h), Image.LANCZOS)
+    canvas = Image.new("RGBA", (w, h), (*bg_color, 255))
 
-    arr = np.array(img, dtype=np.float32)
+    # Fit character into canvas (80% of canvas height, centered)
+    char_w, char_h = character.size
+    max_h = int(h * 0.8)
+    max_w = int(w * 0.8)
+    scale = min(max_w / char_w, max_h / char_h)
+    new_w = int(char_w * scale)
+    new_h = int(char_h * scale)
+    character = character.resize((new_w, new_h), Image.LANCZOS)
 
-    # Determine if this is dark-on-light (typical doodle) or light-on-dark
-    is_light_background = arr.mean() > 127
+    # Center on canvas
+    x = (w - new_w) // 2
+    y = (h - new_h) // 2
+    canvas.paste(character, (x, y), mask=character)
 
-    if is_light_background:
-        # Invert: dark lines on white → white lines on black
-        arr = 255.0 - arr
-
-    # Boost contrast: stretch the line values to full 0-255 range
-    lo, hi = arr.min(), arr.max()
-    if hi - lo > 1e-3:
-        arr = (arr - lo) / (hi - lo) * 255.0
-    arr = arr.clip(0, 255).astype(np.uint8)
-
-    # Apply a threshold to clean up noise and make lines crisp
-    # Pixels above threshold become full white (lines), rest become black
-    threshold = 30  # low threshold to keep faint strokes
-    arr = np.where(arr > threshold, 255, 0).astype(np.uint8)
-
-    return Image.fromarray(arr).convert("RGB")
+    return canvas.convert("RGB")
 
 
-def build_pipeline(
-    device: str = "cuda",
-    enable_cpu_offload: bool = True,
-    enable_ip_adapter: bool = True,
-    ip_adapter_scale: float = 0.5,
-) -> FluxControlNetPipeline:
-    """Build the FLUX ControlNet pipeline with optional IP-Adapter.
-
-    Args:
-        device: Target device.
-        enable_cpu_offload: Use model CPU offloading to save VRAM (~24 GB needed without).
-        enable_ip_adapter: Whether to load the IP-Adapter for reference-image guidance.
-        ip_adapter_scale: Strength of IP-Adapter influence (0.0–1.0).
-    """
-    controlnet = FluxControlNetModel.from_pretrained(
-        CONTROLNET_MODEL,
-        torch_dtype=torch.bfloat16,
+def build_pipeline(device: str = "cuda") -> WanImageToVideoPipeline:
+    """Load Wan2.1 14B I2V pipeline."""
+    vae = AutoencoderKLWan.from_pretrained(
+        WAN_MODEL,
+        subfolder="vae",
+        torch_dtype=torch.float32,
     )
 
-    pipe = FluxControlNetPipeline.from_pretrained(
-        BASE_MODEL,
-        controlnet=controlnet,
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        WAN_MODEL,
+        vae=vae,
         torch_dtype=torch.bfloat16,
     )
-
-    if enable_ip_adapter:
-        pipe.load_ip_adapter(
-            IP_ADAPTER_REPO,
-            weight_name=IP_ADAPTER_WEIGHTS,
-            image_encoder_pretrained_model_name_or_path=IMAGE_ENCODER,
-        )
-        pipe.set_ip_adapter_scale(ip_adapter_scale)
-
-    if enable_cpu_offload:
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to(device)
+    pipe.to(device)
 
     return pipe
 
 
-def generate(
-    pipe: FluxControlNetPipeline,
+def generate_video(
+    pipe: WanImageToVideoPipeline,
     doodle: Image.Image,
-    prompt: str,
-    reference_image: Image.Image | None = None,
-    controlnet_conditioning_scale: float = 0.9,
-    ip_adapter_scale: float | None = None,
-    num_inference_steps: int = 28,
-    guidance_scale: float = 3.5,
-    width: int = 1024,
-    height: int = 1024,
+    prompt: str = FIXED_PROMPT,
+    bg_color: tuple[int, int, int] = (135, 206, 235),
+    num_frames: int = 81,
+    num_inference_steps: int = 30,
+    guidance_scale: float = 5.0,
     seed: int = -1,
-) -> tuple[Image.Image, Image.Image]:
-    """Generate a realistic image from a doodle.
+) -> tuple[str, Image.Image]:
+    """Generate a video from a doodle.
 
     Returns:
-        Tuple of (generated_image, preprocessed_control_image) so the user
-        can verify the control signal looks correct.
+        Tuple of (video_path, prepared_input_image).
     """
-    # Snap dimensions
-    width -= width % 16
-    height -= height % 16
-
-    control_image = preprocess_doodle(doodle, target_size=(width, height))
-
-    if ip_adapter_scale is not None:
-        pipe.set_ip_adapter_scale(ip_adapter_scale)
+    input_image = prepare_input_image(doodle, bg_color=bg_color)
 
     generator = None
     if seed >= 0:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    kwargs = dict(
+    output = pipe(
+        image=input_image,
         prompt=prompt,
-        control_image=control_image,
-        controlnet_conditioning_scale=controlnet_conditioning_scale,
+        negative_prompt="blurry, distorted, deformed, ugly, low quality",
+        num_frames=num_frames,
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
-        width=width,
-        height=height,
         generator=generator,
     )
 
-    if reference_image is not None:
-        ref = reference_image.resize((width, height), Image.LANCZOS)
-        kwargs["ip_adapter_image"] = ref
+    video_path = "/tmp/doodle_video.mp4"
+    export_to_video(output.frames[0], video_path, fps=16)
 
-    result = pipe(**kwargs).images[0]
-    return result, control_image
+    return video_path, input_image

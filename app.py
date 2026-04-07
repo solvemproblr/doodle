@@ -1,5 +1,7 @@
 """
-Gradio UI for Doodle-to-Realistic Image generation.
+Gradio UI for Doodle-to-Video.
+
+Upload a child's doodle → get an animated video with the character in a scene.
 
 Launch with:
     python app.py
@@ -7,115 +9,99 @@ Launch with:
 
 import gradio as gr
 from PIL import Image
-from pipeline import build_pipeline, generate
+from pipeline import build_pipeline, generate_video, FIXED_PROMPT
 
 
 pipe = None
 
 
-def load_pipeline(use_ip_adapter: bool = True):
+def load_pipeline():
     global pipe
     if pipe is None:
-        gr.Info("Loading models — this may take a few minutes on first run...")
-        pipe = build_pipeline(
-            enable_ip_adapter=use_ip_adapter,
-            enable_cpu_offload=True,
-        )
+        gr.Info("Loading Wan2.1 14B — this may take a few minutes on first run...")
+        pipe = build_pipeline()
         gr.Info("Pipeline ready!")
     return pipe
 
 
+BG_COLORS = {
+    "Sky Blue": (135, 206, 235),
+    "Meadow Green": (124, 185, 100),
+    "Sunset Orange": (255, 183, 120),
+    "Sandy Beach": (237, 221, 178),
+    "Snowy White": (230, 235, 240),
+    "Night Sky": (25, 25, 60),
+}
+
+
 def run(
     doodle: Image.Image | None,
-    reference_image: Image.Image | None,
-    prompt: str,
-    controlnet_scale: float,
-    ip_adapter_scale: float,
+    bg_choice: str,
+    num_frames: int,
     steps: int,
-    guidance_scale: float,
-    width: int,
-    height: int,
+    guidance: float,
     seed: int,
 ):
     if doodle is None:
-        raise gr.Error("Please upload or draw a doodle first.")
+        raise gr.Error("Please upload a doodle first.")
 
-    if not prompt.strip():
-        raise gr.Error("Please enter a text prompt describing the desired output.")
+    p = load_pipeline()
+    bg_color = BG_COLORS.get(bg_choice, (135, 206, 235))
 
-    p = load_pipeline(use_ip_adapter=reference_image is not None)
-
-    result, control_preview = generate(
+    video_path, input_preview = generate_video(
         pipe=p,
         doodle=doodle,
-        prompt=prompt,
-        reference_image=reference_image,
-        controlnet_conditioning_scale=controlnet_scale,
-        ip_adapter_scale=ip_adapter_scale if reference_image else None,
-        num_inference_steps=steps,
-        guidance_scale=guidance_scale,
-        width=width,
-        height=height,
-        seed=seed,
+        bg_color=bg_color,
+        num_frames=int(num_frames),
+        num_inference_steps=int(steps),
+        guidance_scale=guidance,
+        seed=int(seed),
     )
-    return result, control_preview
+    return video_path, input_preview
 
 
 def create_ui():
-    with gr.Blocks(title="Doodle to Realistic Image") as demo:
-        gr.Markdown("# Doodle to Realistic Image\n"
-                     "Upload a child's doodle and get a realistic version back. "
-                     "Optionally add a reference photo to guide style/appearance.")
+    with gr.Blocks(title="Doodle to Video") as demo:
+        gr.Markdown(
+            "# Doodle to Video\n"
+            "Upload your child's drawing and watch it come to life in a magical scene!"
+        )
 
         with gr.Row():
             with gr.Column():
                 doodle_input = gr.Image(
-                    label="Doodle (upload or draw)",
+                    label="Upload doodle",
                     type="pil",
                     sources=["upload", "clipboard"],
                 )
-                reference_input = gr.Image(
-                    label="Reference image (optional — guides style via IP-Adapter)",
-                    type="pil",
-                    sources=["upload", "clipboard"],
-                )
-                prompt_input = gr.Textbox(
-                    label="Prompt",
-                    placeholder="a fluffy orange cat sitting on grass, photorealistic, detailed",
-                    lines=2,
+                bg_choice = gr.Dropdown(
+                    choices=list(BG_COLORS.keys()),
+                    value="Sky Blue",
+                    label="Scene background",
                 )
 
                 with gr.Accordion("Advanced settings", open=False):
-                    controlnet_scale = gr.Slider(0.0, 2.0, value=0.9, step=0.05,
-                                                  label="ControlNet strength")
-                    ip_scale = gr.Slider(0.0, 1.5, value=0.5, step=0.05,
-                                          label="IP-Adapter strength")
-                    steps = gr.Slider(10, 50, value=28, step=1,
+                    num_frames = gr.Slider(33, 121, value=81, step=8,
+                                            label="Number of frames (more = longer video)")
+                    steps = gr.Slider(10, 50, value=30, step=1,
                                        label="Inference steps")
-                    guidance = gr.Slider(1.0, 10.0, value=3.5, step=0.5,
+                    guidance = gr.Slider(1.0, 10.0, value=5.0, step=0.5,
                                           label="Guidance scale")
-                    with gr.Row():
-                        width = gr.Slider(512, 1536, value=1024, step=64, label="Width")
-                        height = gr.Slider(512, 1536, value=1024, step=64, label="Height")
                     seed = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
 
-                generate_btn = gr.Button("Generate", variant="primary")
+                generate_btn = gr.Button("Generate Video", variant="primary")
 
             with gr.Column():
-                output_image = gr.Image(label="Result", type="pil")
-                control_preview = gr.Image(
-                    label="Control image (what ControlNet sees — should be white lines on black)",
+                output_video = gr.Video(label="Result")
+                input_preview = gr.Image(
+                    label="Input to Wan (character on background)",
                     type="pil",
                 )
 
         generate_btn.click(
             fn=run,
-            inputs=[
-                doodle_input, reference_input, prompt_input,
-                controlnet_scale, ip_scale,
-                steps, guidance, width, height, seed,
-            ],
-            outputs=[output_image, control_preview],
+            inputs=[doodle_input, bg_choice, num_frames, steps, guidance, seed],
+            outputs=[output_video, input_preview],
         )
 
     return demo
